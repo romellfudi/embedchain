@@ -26,7 +26,7 @@ DB_DIR = os.path.join(ABS_PATH, "db")
 
 
 class EmbedChain:
-    def __init__(self, db=None):
+    def __init__(self, db=None, model="gpt-3.5-turbo"):
         """
          Initializes the EmbedChain instance, sets up a vector DB client and
         creates a collection.
@@ -35,9 +35,13 @@ class EmbedChain:
         """
         if db is None:
             db = ChromaDB()
+        self.model = model
+        self.max_tokens = 50
         self.db_client = db.client
         self.collection = db.collection
         self.user_asks = []
+        self.last_context = ""
+        self.last_embedding = None
 
     def _get_loader(self, data_type):
         """
@@ -87,11 +91,13 @@ class EmbedChain:
 
         :param data_type: The type of the data to add.
         :param url: The URL where the data is located.
+
+        :return: The result and the numbers of chunks added
         """
         loader = self._get_loader(data_type)
         chunker = self._get_chunker(data_type)
         self.user_asks.append([data_type, url])
-        self.load_and_embed(loader, chunker, url)
+        return self.load_and_embed(loader, chunker, url)
 
     def add_local(self, data_type, content):
         """
@@ -101,11 +107,13 @@ class EmbedChain:
 
         :param data_type: The type of the data to add.
         :param content: The local data. Refer to the `README` for formatting.
+        
+        :return: The result and the numbers of chunks added
         """
         loader = self._get_loader(data_type)
         chunker = self._get_chunker(data_type)
         self.user_asks.append([data_type, content])
-        self.load_and_embed(loader, chunker, content)
+        return self.load_and_embed(loader, chunker, content)
 
     def load_and_embed(self, loader, chunker, url):
         """
@@ -114,6 +122,8 @@ class EmbedChain:
         :param loader: The loader to use to load the data.
         :param chunker: The chunker to use to chunk the data.
         :param url: The URL where the data is located.
+        
+        :return: The result and the numbers of chunks added
         """
         embeddings_data = chunker.create_chunks(loader, url)
         documents = embeddings_data["documents"]
@@ -131,8 +141,7 @@ class EmbedChain:
             data_dict = {id: value for id, value in data_dict.items() if id not in existing_ids}
 
             if not data_dict:
-                print(f"All data from {url} already exists in the database.")
-                return
+                return f"All data from {url} already exists in the database.", "Total chunks count: 0"
 
             ids = list(data_dict.keys())
             documents, metadatas = zip(*data_dict.values())
@@ -142,7 +151,7 @@ class EmbedChain:
             metadatas=metadatas,
             ids=ids
         )
-        print(f"Successfully saved {url}. Total chunks count: {self.collection.count()}")
+        return f"Successfully saved {url}.", f"Total chunks count: {self.collection.count()}"
 
     def _format_result(self, results):
         return [
@@ -160,15 +169,15 @@ class EmbedChain:
             "role": "user", "content": prompt
         })
         response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo-0613",
+            model=self.model,
             messages=messages,
             temperature=0,
-            max_tokens=1000,
+            max_tokens=self.max_tokens,
             top_p=1,
         )
         return response["choices"][0]["message"]["content"]
     
-    def retrieve_from_database(self, input_query):
+    def retrieve_from_database(self, input_query, max_chunks):
         """
         Queries the vector database based on the given input query.
         Gets relevant doc based on the query
@@ -176,12 +185,13 @@ class EmbedChain:
         :param input_query: The query to use.
         :return: The content of the document that matched your query.
         """
-        result = self.collection.query(
+        results = self.collection.query(
             query_texts=[input_query,],
-            n_results=1,
+            n_results=max_chunks,
         )
-        result_formatted = self._format_result(result)
-        content = result_formatted[0][0].page_content
+        content = '\n'.join([doc for doc in results['documents'][0]])
+        self.last_embedding = input_query
+        self.last_context = content
         return content
     
     def generate_prompt(self, input_query, context):
@@ -211,7 +221,7 @@ class EmbedChain:
         answer = self.get_openai_answer(prompt)
         return answer
 
-    def query(self, input_query):
+    def query(self, input_query, max_chunks = 5, max_tokens= 500):
         """
         Queries the vector database based on the given input query.
         Gets relevant doc based on the query and then passes it to an
@@ -220,7 +230,8 @@ class EmbedChain:
         :param input_query: The query to use.
         :return: The answer to the query.
         """
-        context = self.retrieve_from_database(input_query)
+        self.max_tokens = max_tokens
+        context = self.retrieve_from_database(input_query, max_chunks)
         prompt = self.generate_prompt(input_query, context)
         answer = self.get_answer_from_llm(prompt)
         return answer
